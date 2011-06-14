@@ -51,11 +51,45 @@ namespace mongo {
       map_function = cmdObj["map_function"].String();
     }
 
+    BSONObj bson_encode(object d) {
+      object bson = import("bson");
+      object pystr = bson.attr("BSON")
+        .attr("encode")(d);
+      char const * cstr = extract<char const*>(pystr);
+      return BSONObj(cstr);
+    }
+
+    object bson_decode(BSONObj o) {
+      object bson = import("bson");
+      return bson.attr("BSON")(
+                               boost::python::str(o.objdata(), o.objsize()))
+        .attr("decode")();
+    }
+
+    void emit(object k, object v) {
+      dict d;
+      d["_id"] = k;
+      d["value"] = v;
+      BSONObj result = bson_encode(d);
+      log() << "emit(" << result << ")\n";
+    }
+
     class PythonCommand : public Command {
 
+    private:
+      object _main_namespace;
+      object _bson;
+
     public:
+
       PythonCommand() : Command("python", false, "python") {
         Py_Initialize();
+
+        object main_module = import("__main__");
+        _main_namespace = main_module.attr("__dict__");
+        _main_namespace["bson"] = _bson = import("bson");
+        _main_namespace["pymongo"] = import("pymongo");
+        _main_namespace["emit"] = emit;
       }
       
       virtual bool slaveOk() const { return !replSet; }
@@ -77,17 +111,19 @@ namespace mongo {
         readlock lock( config.ns );        
         Client::Context ctx( config.ns );
 
-        object main_module = import("__main__");
-        object main_namespace = main_module.attr("__dict__");
-        object bson = import("bson");
-        main_namespace.attr("clear")();
-        main_namespace["bson"] = bson;
-        main_namespace["pymongo"] = import("pymongo");
+        object map_function;
 
-        exec(config.map_function.c_str(), main_namespace);
-        object map_function = main_namespace["map"];
-        object wr_stdout = import("sys").attr("stdout").attr("write");
-
+        try {
+          exec(config.map_function.c_str(), _main_namespace);
+          map_function = _main_namespace["map"];
+        }
+        catch(error_already_set const &)
+          {
+            log() << "Error initializing Python MR engine\n";
+            return false;
+          }
+          
+        object wr_stdout  = import("sys").attr("stdout").attr("write");          
         shared_ptr<Cursor> temp = bestGuessCursor( 
                                                   config.ns.c_str(), 
                                                   config.query, BSONObj() );
@@ -97,21 +133,16 @@ namespace mongo {
                                                             temp , config.ns.c_str() ) );
             cursor->ok();
             cursor->advance()) {
+          log() << "Iterating\n";
           BSONObj o = cursor->current();
-          object o_str = boost::python::str(o.objdata(), o.objsize());
-          object o_bson = bson.attr("BSON")(o_str);
+          object obj = bson_decode(o);
           try {
-            object map_gen = map_function(o_bson.attr("decode")());
-            object map_iter = map_gen.attr("__iter__")();
-            while(true) {
-              object value =map_iter.attr("next")();
-              wr_stdout(value);
-              wr_stdout("\n");
-            }
+            map_function(obj);
           }
           catch(error_already_set const &)
             {
-              break;
+              log() << "Error iterating Python MR engine\n";
+              return false;
             }
              // result.append(string(o["_id"]), extract<double>(mr));
         }
@@ -121,7 +152,6 @@ namespace mongo {
 
         return true;
       };
-
     } pythonCommand; // end of PythonCommand class
     
   }
